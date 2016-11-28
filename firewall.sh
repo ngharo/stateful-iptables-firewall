@@ -190,6 +190,5 @@ if [[ -n $vpn_interface ]]; then
     run -4 "-P FORWARD DROP"
     run -4 "-A natchain -i ${vpn_interface} -o ${vpn_interface} -j DROP" # drop client-to-client traffic
     run -4 "-A natchain -i ${vpn_interface} -j ACCEPT"
-    run -4 "-A natchain -i docker0 -j ACCEPT"
     run -4 "-t nat -A POSTROUTING -s ${vpn_subnet} -o eth0 -j MASQUERADE"
 fi
