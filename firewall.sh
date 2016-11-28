@@ -1,37 +1,39 @@
 #!/bin/bash
-# Created by Nicholas Hall <ngharo@gmail.com>
 declare -A public_services_tcp
 declare -A public_services_udp
 declare -A private_services_tcp
 declare -A private_services_udp
 
-public_ipv4="1.1.1.1/32"
-public_ipv6="2001::1/128"
-public_services_tcp=([HTTP]=80 [HTTPS]=443)
-public_services_udp=()
-
-private_ipv4="1.1.1.2/32"
-private_ipv6="2001::2/128"
-                                             # port range
-private_services_tcp=([SSH]=22022 [rtorrent]="61000:61100")
-private_services_udp=([OpenVPN]=35221)
-
-vpn_interface="tun0"
-vpn_subnet="172.16.23.0/24"
-vpn_gateway="172.16.23.1/32"
-
-# reply to pings?
 allow_icmp_ping=true
 
-##########################################################
-# helper functions
-#
+public_ipv4="104.236.18.1/32"
+public_ipv6="2604:a880::1/128"
+public_services_tcp=(
+    # single port: [desc]=port_number
+    #  for ranges: [desc]=start:end
+    [HTTP]=80
+    [HTTPS]=443
+)
+public_services_udp=(
+    [MOSH]=23563
+)
+
+# private_ipv4="1.2.3.4/32"
+# private_ipv6="2001:dead:beef::/128"
+# private_services_tcp=([rtorrent]="45400:45600")
+# private_services_udp=([rtorrent]="45400:45600")
+
+# vpn_interface="tun0"
+# vpn_subnet="172.16.23.0/24"
+# vpn_gateway="172.16.23.1/32"
+
+###################################################################
+# run [-4|-6] IPTABLES_COMMAND
 # dual firewall (ipv4+ipv6) wrapper
 run() {
-    # by default run command for ipv4 and ipv6 firewall
     local commands="/sbin/iptables /sbin/ip6tables";
 
-    # override to specify which firewall
+    # overrides to run on single firewall
     if [[ "-4" == "${1}" ]]; then
         commands="/sbin/iptables"
         shift
@@ -42,8 +44,12 @@ run() {
 
     local iptables_args="$1"
     for cmd in $commands; do
-        [[ "$cmd" == "/sbin/ip6tables" ]] && iptables_args=$(echo "$iptables_args" | to6)
-        echo "${cmd} ${iptables_args}"
+        if [[ "$cmd" == "/sbin/ip6tables" ]]; then
+            # refuckers the iptables command to run on ip6tables
+            iptables_args=$(echo "$iptables_args" | to6)
+        fi
+
+        echo "[exec] ${cmd} ${iptables_args}" # debug/logging
         $($cmd $iptables_args)
     done
 }
@@ -51,7 +57,7 @@ run() {
 # replace IPv4 specific bits with IPv6 bits
 to6() {
     declare -A mapping
-    # add any additional ipv4 -> ipv6 replacements to the following array
+    # add any additional ipv4 -> ipv6 pattern replacements to the following array
     mapping=(
         ["icmp-port-unreachable"]="icmp6-port-unreachable"
         ["icmp-proto-unreachable"]="icmp6-adm-prohibited"
@@ -90,8 +96,10 @@ openports() {
 # Flush and allow all
 run "-F"
 run "-X"
-run "-t nat -F"
-run "-t nat -X"
+if [[ -n $vpn_interface ]]; then
+    run "-t nat -F"
+    run "-t nat -X"
+fi
 run "-t mangle -F"
 run "-t mangle -X"
 run "-P INPUT ACCEPT"
@@ -101,8 +109,10 @@ run "-P OUTPUT ACCEPT"
 # Chains we'll be using
 run "-N TCP"
 run "-N UDP"
-run -4 "-N natchain"
-run -4 "-N natforwarding"
+if [[ -n $vpn_interface ]]; then
+    run -4 "-N natchain"
+    run -4 "-N natforwarding"
+fi
 
 # Establish default policies
 run "-P FORWARD DROP"
@@ -114,7 +124,7 @@ run "-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
 
 # Trusted interfaces
 run "-A INPUT -i lo -j ACCEPT"
-run "-A INPUT -i tun0 -j ACCEPT"
+[[ -n $vpn_interface ]] && run "-A INPUT -i ${vpn_interface} -j ACCEPT"
 
 # allow ICMPv6 neighbor discovery
 # We do this because ICMPv6 remain untracked and get classified as invalid
@@ -128,6 +138,10 @@ if $allow_icmp_ping; then
     run -4 "-A INPUT -p icmp --icmp-type 8 -m conntrack --ctstate NEW -j ACCEPT"
     run -6 "-A INPUT -p ipv6-icmp -j ACCEPT"
 fi
+
+# Disallow DHT packets now to prevent being added to the timeout box
+run "-A INPUT -p udp --dport 23223 -j REJECT --reject-with icmp-port-unreachable"
+run "-A INPUT -p tcp --dport 23224 -j REJECT --reject-with tcp-reset"
 
 # append any new traffic onto our UDP/TCP chains for further analysis
 run "-A INPUT -p udp -m conntrack --ctstate NEW -j UDP"
@@ -146,10 +160,12 @@ openports -4 UDP $public_ipv4 public_services_udp
 openports -6 TCP $public_ipv6 public_services_tcp
 openports -6 UDP $public_ipv6 public_services_udp
 
-openports -4 TCP $private_ipv4 private_services_tcp
-openports -4 UDP $private_ipv4 private_services_udp
-openports -6 TCP $private_ipv6 private_services_tcp
-openports -6 UDP $private_ipv6 private_services_udp
+if [[ -n $private_ipv4 ]]; then
+    openports -4 TCP $private_ipv4 private_services_tcp
+    openports -4 UDP $private_ipv4 private_services_udp
+    openports -6 TCP $private_ipv6 private_services_tcp
+    openports -6 UDP $private_ipv6 private_services_udp
+fi
 
 # port scan trickery
 # https://wiki.archlinux.org/index.php/Simple_Stateful_Firewall#Tricking_port_scanners
@@ -165,12 +181,15 @@ run "-A INPUT -p udp -m recent --set --name UDP-PORTSCAN -j REJECT --reject-with
 run "-D INPUT -j REJECT --reject-with icmp-proto-unreachable"
 run "-A INPUT -j REJECT --reject-with icmp-proto-unreachable"
 
-# IPv4 NAT for VPN clients
-run -4 "-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
-run -4 "-A FORWARD -j natchain"
-run -4 "-A FORWARD -j natforwarding"
-run -4 "-A FORWARD -j REJECT --reject-with icmp-host-unreach"
-run -4 "-P FORWARD DROP"
-run -4 "-A natchain -i ${vpn_interface} -o ${vpn_interface} -j DROP" # drop client-to-client traffic
-run -4 "-A natchain -i ${vpn_interface} -j ACCEPT"
-run -4 "-t nat -A POSTROUTING -s ${vpn_subnet} -o eth0 -j MASQUERADE"
+# NAT for VPN clients
+if [[ -n $vpn_interface ]]; then
+    run -4 "-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+    run -4 "-A FORWARD -j natchain"
+    run -4 "-A FORWARD -j natforwarding"
+    run -4 "-A FORWARD -j REJECT --reject-with icmp-host-unreach"
+    run -4 "-P FORWARD DROP"
+    run -4 "-A natchain -i ${vpn_interface} -o ${vpn_interface} -j DROP" # drop client-to-client traffic
+    run -4 "-A natchain -i ${vpn_interface} -j ACCEPT"
+    run -4 "-A natchain -i docker0 -j ACCEPT"
+    run -4 "-t nat -A POSTROUTING -s ${vpn_subnet} -o eth0 -j MASQUERADE"
+fi
